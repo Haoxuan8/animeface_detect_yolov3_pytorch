@@ -1,6 +1,7 @@
 # animeface_detect_yolov3_pytorch
 
 ## output samples
-![](./samples/text2.png)
+
+![](./samples/test2.png)
 
 # TODO
