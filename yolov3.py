@@ -27,16 +27,16 @@ class yolov3_darknet(nn.Module):
         super(yolov3_darknet, self).__init__()
         self.blocks=self.parse_cfg(cfg)
         self.net_info,self.module_list=self.create_modules(self.blocks,torch.cuda.is_available())  #convert to pytorch models
-        self.outputs=[]
         
     def forward(self, x, CUDA):
         if CUDA:
             x=x.cuda()
         
-        self.outputs=[]
+        
         modules = self.blocks[1:]
         outputs = {}   #We cache the outputs for the route layer
         detections=[]
+        detections_prev=[]
         for i, module in enumerate(modules):        
             module_type = (module["type"])
             
@@ -75,7 +75,7 @@ class yolov3_darknet(nn.Module):
                 num_classes = int (module["classes"])
         
                 #Transform 
-                self.outputs.append(x)
+                detections_prev.append(x)
                 x = x.data
                 self.module_list[i][0].stride =  inp_dim // x.size(2)
                 self.module_list[i][0].grid_size = inp_dim // self.module_list[i][0].stride
@@ -92,7 +92,7 @@ class yolov3_darknet(nn.Module):
         
             outputs[i] = x
         
-        return detections
+        return detections_prev,detections
     
     def load_weights(self, weightfile):
         #Open the weights file

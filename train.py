@@ -13,6 +13,7 @@ import yolov3
 import util
 import yololoss
 import time
+import argparse
 
 
 params = {'xy': 0.2,  # xy loss gain
@@ -25,7 +26,40 @@ params = {'xy': 0.2,  # xy loss gain
        'momentum': 0.90,  # SGD momentum
        'weight_decay': 0.0005}  # optimizer weight decay
 
-savepath='animeface.pt'
+def test(model, path, batch_size, yolo_loss):
+    net_h,net_w=int(model.net_info['height']),int(model.net_info['width'])
+    dataset=datasets.LoadTrainDataset(path,path, net_h,net_w)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=0,
+        collate_fn=dataset.collate_fn,
+    )    
+    model.eval()
+    test_loss=float(0)
+    for bn,(paths,imgs,targets) in enumerate(dataloader):
+        pred,_=model(imgs,torch.cuda.is_available())
+            
+        #computer loss
+        losses_name = ["total_loss", "x", "y", "w", "h", "conf", "cls"]
+        losses = []
+        for _ in range(len(losses_name)):
+            losses.append([])
+            
+        for i in range(3):
+            _loss_item = yolo_loss[i](pred[i], targets)
+            for j, l in enumerate(_loss_item):
+                losses[j].append(l)
+        losses = [sum(l) for l in losses]
+        loss = losses[0] 
+        test_loss+=float(loss)
+    
+    test_loss/=len(dataloader)
+    return test_loss
+    
+
 
 
 def build_yolo_loss(net):
@@ -41,13 +75,11 @@ def build_yolo_loss(net):
     return yolo_loss
             
 
-if __name__=='__main__':
+def train(cfg, names, epochs, batch_size, pretrained, trainpath, validpath):
     cuda=torch.cuda.is_available()
     device = torch.device('cuda:0' if cuda else 'cpu')
-    batch_size=1
-    epochs=100
     
-    net=yolov3.yolov3_darknet('cfg/animeface.cfg').to(device)
+    net=yolov3.yolov3_darknet(cfg).to(device)
     net_h,net_w=int(net.net_info['height']),int(net.net_info['width'])
     
     yolo_loss=build_yolo_loss(net)
@@ -57,25 +89,32 @@ if __name__=='__main__':
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[round(epochs * x) for x in (0.8, 0.9)], gamma=0.1)
     
     
-    dataset=datasets.LoadTrainDataset('images/data/img','images/data/img', net_h,net_w)
+    dataset=datasets.LoadTrainDataset(trainpath,trainpath, net_h,net_w)
     dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
+            pin_memory=True,
             num_workers=0,
             collate_fn=dataset.collate_fn,
         )
+    
+    
+    if pretrained:
+        print('loading predtrained net')
+        net.load_state_dict(torch.load('model_state_dict.pt'))
 
     
 
     nb = len(dataloader)
     n_burnin = min(round(nb / 5 + 1), 1000)  # burn-in batches
     losses_epoch=[]
-    
+    mlosses_epoch=[]
+    best_loss=float('inf')
     for epoch in range(epochs):
         net.train()
         scheduler.step()
-        
+        mloss=torch.zeros(1).to(device)
         for bn,(paths,imgs,targets) in enumerate(dataloader):
             optimizer.zero_grad()
             imgs=imgs.to(device)
@@ -87,7 +126,7 @@ if __name__=='__main__':
                     x['lr'] = lr
             
             #run net
-            pred=net(imgs,torch.cuda.is_available())
+            pred,_=net(imgs,torch.cuda.is_available())
             
             #computer loss
             losses_name = ["total_loss", "x", "y", "w", "h", "conf", "cls"]
@@ -96,7 +135,7 @@ if __name__=='__main__':
                 losses.append([])
                 
             for i in range(3):
-                _loss_item = yolo_loss[i](net.outputs[i], targets)
+                _loss_item = yolo_loss[i](pred[i], targets)
                 for j, l in enumerate(_loss_item):
                     losses[j].append(l)
             losses = [sum(l) for l in losses]
@@ -104,27 +143,53 @@ if __name__=='__main__':
             if torch.isnan(loss):
                 print('WARNING: nan loss detected, ending training')
             
+            mloss=(mloss*bn+loss)/(bn+1)
             #gradient
             loss.backward()
             
             optimizer.step()
             
-
             losses_epoch.append(loss)
-            s = 'epoch: %d   batch_num: %d   loss: %.3f'%(epoch,bn,loss)
+            mlosses_epoch.append(mloss)
+            
+            s = 'epoch: %d\tbatch_num: %d\tloss: %.3f\tmloss: %.3f'%(epoch,bn,loss,mloss)
             print(s)
             
             with open('result.txt','a') as f:
-                f.write(s+'\n')
+                f.write('%d'%epoch+' '+'%g'%loss+'\n')
         
+        test_loss=test(net,validpath, batch_size,yolo_loss)
+        print('test_loss: %.3f'%test_loss)
+        
+        if test_loss<best_loss:
+            best_loss=test_loss
+            print('saving model...')
+            torch.save(net.state_dict(), 'model_state_dict.pt')
+            
+        '''
         if epoch % 1==0: #each epoch save net
-            torch.save(net, savepath)
+            torch.save(net.state_dict(), 'model_state_dict.pt')
+        '''
     
-    
-    torch.save(net, savepath)
+    #torch.save(net.state_dict(), 'model_state_dict.pt')
     print('finish!')
-    print(losses_epoch)
     
+
+if __name__=='__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+    parser.add_argument('--bs', type=int, default=1, help='size of each image batch')
+    parser.add_argument('--cfg', type=str, default='cfg/animeface.cfg', help='cfg file path')
+    parser.add_argument('--names', type=str, default='data/animeface.names', help='names file path')
+    parser.add_argument('--trainpath', type=str, default='imgs/train', help='train file path')
+    parser.add_argument('--validpath', type=str, default='imgs/valid', help='valid file path')
+    parser.add_argument('--pretrained', type=str, default=0, help='pretrained')
+    opt = parser.parse_args()
+    print(opt)
+    
+    train(opt.cfg, opt.names, batch_size=opt.bs, epochs=opt.epochs, trainpath=opt.trainpath, validpath=opt.validpath, pretrained=opt.pretrained)
+    
+
     
     
     
